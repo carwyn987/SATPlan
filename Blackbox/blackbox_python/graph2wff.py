@@ -52,6 +52,8 @@ class SATEncoder:
         self.goal_assumptions: list[int] = []
         # Stable mapping used by incremental SAT across horizons.
         self._uid_to_var: dict[int, int] = {}
+        # Track last encoded time layer for incremental skip optimisation.
+        self._prev_maxtime: int = 0
 
     # ── Main entry point ─────────────────────────────────────────────────
 
@@ -70,6 +72,7 @@ class SATEncoder:
             self.numvar = 0
             self.prop2vertex = [None]
             self._uid_to_var = {}
+            self._prev_maxtime = 0
 
         # Mark vertices to encode.
         if incremental:
@@ -84,13 +87,16 @@ class SATEncoder:
         acts_only = bool(self.axioms & BB_OutputOpPreOp)
         self._assign_props(maxtime, num_goals, acts_only, incremental=incremental)
 
-        # Emit static initial-state units first in incremental mode so CNF can
-        # grow by prefix as horizons increase.
-        if incremental and (self.axioms & BB_OutputOpPre):
+        # In incremental mode, only emit initial-state clauses on the first call.
+        if incremental and self._prev_maxtime == 0 and (self.axioms & BB_OutputOpPre):
             self._generate_initial_state()
 
+        # Determine which layers to encode: skip already-encoded ones in
+        # incremental mode.
+        start_layer = self._prev_maxtime if incremental else 0
+
         # Generate axioms for each time layer
-        for t in range(maxtime):
+        for t in range(start_layer, maxtime):
             op_table = self.graph.op_table[t]
             fact_table = self.graph.fact_table[t]
             fact_table_next = self.graph.fact_table[t + 1]
@@ -111,13 +117,16 @@ class SATEncoder:
                 self._generate_frame(fact_table_next, simplified=is_last)
 
             if self.axioms & BB_OutputOpMutex:
-                self._generate_op_mutex(op_table)
+                self._generate_op_mutex(op_table, incremental=incremental)
 
             if self.axioms & BB_OutputFactMutex:
                 self._generate_fact_mutex(fact_table_next)
 
             if self.axioms & BB_OutputOpPreOp:
                 self._generate_op_pre_op(op_table, fact_table)
+
+        if incremental:
+            self._prev_maxtime = maxtime
 
         # Initial state unit clauses
         if (self.axioms & BB_OutputOpPre) and not incremental:
@@ -264,20 +273,148 @@ class SATEncoder:
             if clause:
                 self.clauses.append(clause)
 
-    def _generate_op_mutex(self, op_table: HashTable):
-        """Operator mutual exclusion: (NOT op1) OR (NOT op2)."""
-        seen: set[tuple[int, int]] = set()
-        for op in op_table:
-            if not op.needed or op.prop == 0:
-                continue
-            for excl_op in op.exclusive:
-                if not excl_op.needed or excl_op.prop == 0:
+    # ── Auxiliary variable allocation ────────────────────────────────────
+
+    def _next_aux_var(self) -> int:
+        """Allocate a fresh auxiliary SAT variable (not tied to any vertex)."""
+        self.numvar += 1
+        self.prop2vertex.append(None)
+        return self.numvar
+
+    # ── AMO ladder encoding ──────────────────────────────────────────────
+
+    def _amo_ladder(self, lits: list[int]):
+        """At-most-one constraint via ladder/commander encoding.
+
+        For k literals emits 3(k-1)-1 clauses using k-1 auxiliary variables,
+        compared to k(k-1)/2 for pairwise.  Falls back to pairwise for k<=3.
+        """
+        k = len(lits)
+        if k <= 1:
+            return
+        if k <= 3:
+            # Pairwise is same cost or cheaper for small k
+            for i in range(k):
+                for j in range(i + 1, k):
+                    self.clauses.append([-lits[i], -lits[j]])
+            return
+
+        # Ladder encoding: auxiliary variables a_1 .. a_{k-1}
+        aux = [self._next_aux_var() for _ in range(k - 1)]
+
+        # First rung: x_0 => a_0
+        self.clauses.append([-lits[0], aux[0]])
+
+        for i in range(1, k - 1):
+            # x_i => a_i  (if x_i is true, ladder must be on from here)
+            self.clauses.append([-lits[i], aux[i]])
+            # a_{i-1} => a_i  (ladder propagation)
+            self.clauses.append([-aux[i - 1], aux[i]])
+            # NOT(x_i AND a_{i-1})  (at most one: can't pick x_i if ladder already on)
+            self.clauses.append([-lits[i], -aux[i - 1]])
+
+        # Last rung: NOT(x_{k-1} AND a_{k-2})
+        self.clauses.append([-lits[k - 1], -aux[k - 2]])
+
+    # ── Mutex clique finding ─────────────────────────────────────────────
+
+    @staticmethod
+    def _find_mutex_cliques(ops: list[Vertex]) -> tuple[list[list[int]], list[tuple[int, int]]]:
+        """Greedy clique cover over the mutex graph of *ops*.
+
+        Returns ``(cliques, leftover_edges)`` where each clique is a list of
+        indices into *ops*, and leftover_edges are mutex pairs not covered by
+        any clique.
+        """
+        n = len(ops)
+        # Build adjacency using prop-based identity
+        prop_to_idx = {ops[i].prop: i for i in range(n)}
+        adj: list[set[int]] = [set() for _ in range(n)]
+        all_edges: set[tuple[int, int]] = set()
+
+        for i in range(n):
+            for excl in ops[i].exclusive:
+                if not excl.needed or excl.prop == 0:
                     continue
-                pair = (min(op.prop, excl_op.prop), max(op.prop, excl_op.prop))
-                if pair in seen:
-                    continue
-                seen.add(pair)
-                self.clauses.append([-op.prop, -excl_op.prop])
+                j = prop_to_idx.get(excl.prop)
+                if j is not None and j != i:
+                    edge = (min(i, j), max(i, j))
+                    if edge not in all_edges:
+                        all_edges.add(edge)
+                        adj[i].add(j)
+                        adj[j].add(i)
+
+        covered_edges: set[tuple[int, int]] = set()
+        cliques: list[list[int]] = []
+        remaining = set(range(n))
+
+        while remaining:
+            # Pick vertex with highest degree in remaining graph
+            seed = max(remaining, key=lambda x: len(adj[x] & remaining))
+            if not (adj[seed] & remaining):
+                break  # no more edges
+
+            # Grow maximal clique from seed
+            clique = [seed]
+            candidates = adj[seed] & remaining
+            for c in sorted(candidates, key=lambda x: -len(adj[x] & candidates)):
+                if all(c in adj[m] for m in clique):
+                    clique.append(c)
+
+            if len(clique) < 2:
+                break
+
+            # Record covered edges
+            for a in range(len(clique)):
+                for b in range(a + 1, len(clique)):
+                    edge = (min(clique[a], clique[b]), max(clique[a], clique[b]))
+                    covered_edges.add(edge)
+
+            cliques.append(clique)
+
+            # Remove clique members from remaining
+            for m in clique:
+                remaining.discard(m)
+
+        leftover = [e for e in all_edges if e not in covered_edges]
+        return cliques, leftover
+
+    # ── Operator mutex generation ────────────────────────────────────────
+
+    def _generate_op_mutex(self, op_table: HashTable, incremental: bool = False):
+        """Operator mutual exclusion via AMO ladder encoding.
+
+        For incremental SAT, falls back to pairwise encoding since auxiliary
+        variable IDs would be unstable across horizons.
+        """
+        # Collect needed ops with assigned props
+        ops = [op for op in op_table if op.needed and op.prop != 0]
+        if not ops:
+            return
+
+        if incremental:
+            # Pairwise fallback for incremental mode
+            seen: set[tuple[int, int]] = set()
+            for op in ops:
+                for excl_op in op.exclusive:
+                    if not excl_op.needed or excl_op.prop == 0:
+                        continue
+                    pair = (min(op.prop, excl_op.prop), max(op.prop, excl_op.prop))
+                    if pair not in seen:
+                        seen.add(pair)
+                        self.clauses.append([-op.prop, -excl_op.prop])
+            return
+
+        # Non-incremental: use clique-based AMO ladder encoding
+        cliques, leftover = self._find_mutex_cliques(ops)
+
+        for clique_indices in cliques:
+            lits = [ops[i].prop for i in clique_indices]
+            self._amo_ladder(lits)
+
+        # Emit pairwise for leftover edges not covered by cliques
+        for i, j in leftover:
+            self.clauses.append([-ops[i].prop, -ops[j].prop])
 
     def _generate_fact_mutex(self, fact_table: HashTable):
         """Fact mutual exclusion: (NOT f1) OR (NOT f2)."""

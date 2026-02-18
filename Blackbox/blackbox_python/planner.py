@@ -22,6 +22,7 @@ from graphplan import PlanningGraph
 from graph2wff import SATEncoder
 from sat_interface import (
     bb_satsolve_cadical, bb_satsolve_glucose, bb_satsolve_maple,
+    bb_satsolve_minisat, bb_satsolve_kissat, bb_satsolve_walksat, bb_satsolve_dpll,
     IncrementalSATSolver,
 )
 from justify import justify_plan
@@ -241,6 +242,11 @@ class Planner:
             'g42': bb_satsolve_glucose,
             'maple': bb_satsolve_maple,
             'mcb': bb_satsolve_maple,
+            'minisat': bb_satsolve_minisat,
+            'mgh': bb_satsolve_minisat,
+            'kissat': bb_satsolve_kissat,
+            'walksat': bb_satsolve_walksat,
+            'dpll': bb_satsolve_dpll,
         }.get(spec.solver_name)
 
         if solver_func is None:
@@ -270,9 +276,18 @@ class Planner:
         if self.debug >= 1:
             print(f"  Running {spec.solver_name} incrementally at time {maxtime}...")
 
+        # Non-incremental solvers fall back to one-shot solving.
+        if spec.solver_name in ('kissat', 'walksat', 'dpll'):
+            if self.debug >= 1:
+                print(f"  {spec.solver_name} does not support incremental mode, "
+                      "falling back to non-incremental")
+            result, _ = self._run_sat_solver(maxtime, num_goals, spec)
+            return result
+
         # Unknown solver names cannot be handled.
         if spec.solver_name not in (
-            'cadical', 'cd195', 'glucose', 'g42', 'maple', 'mcb'
+            'cadical', 'cd195', 'glucose', 'g42', 'maple', 'mcb',
+            'minisat', 'mgh',
         ):
             print(f"  Unknown solver: {spec.solver_name}", file=sys.stderr)
             return Failure
@@ -302,34 +317,19 @@ class Planner:
         encode_sec = time_mod.time() - t0
         self._sat_encode_total_sec += encode_sec
 
+        # The encoder now only returns clauses for newly-encoded layers,
+        # so all returned clauses are the delta to add.
+        total_clauses = state['numclause'] + numclause
+
         if self.debug >= 1:
-            print(f"  CNF: {numvar} vars, {numclause} clauses")
+            print(f"  CNF: {numvar} vars, {total_clauses} clauses")
 
-        prev_numclause = int(state['numclause'])
-        prev_numvar = int(state['numvar'])
-
-        rebuild = False
-        # Incremental encoding is built to be monotone by construction. If the
-        # counts ever regress, reset and rebuild defensively.
-        if prev_numvar > numvar or prev_numclause > numclause:
-            rebuild = True
-
-        if rebuild:
+        if clauses:
+            session.add_clauses(clauses)
             if self.debug >= 1:
-                print("  Rebuilding incremental SAT state (non-monotone CNF detected)")
-            session.reset()
-            delta_clauses = clauses
-        elif prev_numclause == 0:
-            delta_clauses = clauses
-        else:
-            delta_clauses = clauses[prev_numclause:]
+                print(f"  Added {len(clauses)} new clauses incrementally")
 
-        if delta_clauses:
-            session.add_clauses(delta_clauses)
-            if self.debug >= 1:
-                print(f"  Added {len(delta_clauses)} new clauses incrementally")
-
-        state['numclause'] = numclause
+        state['numclause'] = total_clauses
         state['numvar'] = numvar
 
         goal_assumptions = encoder.get_goal_assumptions()
@@ -352,6 +352,80 @@ class Planner:
         if status == Sat:
             encoder.soln2graph(soln)
         return status
+
+    def minimize_plan_actions(self, maxtime: int, num_goals: int) -> int:
+        """Re-encode at *maxtime* with a fresh solver and minimize actions.
+
+        Uses cardinality constraints (PySAT sequential counter) to iteratively
+        tighten the action bound until UNSAT, returning the minimum action
+        count.  Updates graph vertex ``used`` flags with the best solution.
+        """
+        from pysat.card import CardEnc, EncType
+
+        encoder = SATEncoder(self.graph, self.axioms, self.printflag)
+        clauses, numvar, numclause = encoder.encode(maxtime, num_goals)
+
+        # Collect non-NOOP action variables (only those assigned by this encoder).
+        action_vars: list[int] = []
+        for t in range(maxtime):
+            for op in self.graph.op_table[t]:
+                if op.needed and op.prop != 0 and op.prop <= numvar and not op.is_noop:
+                    action_vars.append(op.prop)
+
+        if not action_vars:
+            return 0
+
+        # Fresh solver with the base clauses.
+        opt_session = IncrementalSATSolver(
+            solver_name='cadical', debug=0,
+        )
+        opt_session.add_clauses(clauses)
+
+        # Initial solve to get a starting point.
+        goal_lits = [gv.prop for gv in self.graph.goals_at[maxtime] if gv.prop != 0]
+        status, soln = opt_session.solve(numvar=numvar, assumptions=goal_lits)
+        if status != Sat:
+            opt_session.delete()
+            return -1
+
+        current_count = sum(1 for v in action_vars if v < len(soln) and soln[v] == 1)
+        best_soln = soln
+        top_var = numvar
+
+        # Iteratively tighten.
+        while current_count > 0:
+            bound = current_count - 1
+            card_clauses = CardEnc.atmost(
+                lits=action_vars, bound=bound,
+                top_id=top_var, encoding=EncType.seqcounter,
+            )
+            if not card_clauses.clauses:
+                break
+            new_top = max(abs(lit) for cl in card_clauses.clauses for lit in cl)
+            top_var = max(top_var, new_top)
+
+            opt_session.add_clauses(card_clauses.clauses)
+            status, new_soln = opt_session.solve(
+                numvar=top_var, assumptions=goal_lits,
+            )
+            self._sat_calls += 1
+
+            if status != Sat:
+                break
+
+            best_soln = new_soln
+            new_count = sum(
+                1 for v in action_vars if v < len(new_soln) and new_soln[v] == 1
+            )
+            if self.debug >= 1:
+                print(f"  Action minimization: {current_count} -> {new_count}")
+            current_count = new_count
+
+        opt_session.delete()
+
+        # Map best solution back to graph.
+        encoder.soln2graph(best_soln)
+        return current_count
 
     def get_timing_stats(self) -> dict[str, float | int]:
         """Return cumulative SAT timing counters."""

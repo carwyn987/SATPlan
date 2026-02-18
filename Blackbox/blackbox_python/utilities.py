@@ -163,37 +163,75 @@ def find_all_mutex_ops(op_table: HashTable, fact_table_cur: HashTable,
 def _find_mutex_ops_single(v: Vertex, op_table: HashTable,
                            fact_table_cur: HashTable,
                            fact_table_next: HashTable, time: int):
-    """Find mutexes for a single operator *v*."""
+    """Find mutexes for a single operator *v*.
+
+    Uses **exists-step** semantics for Type 2 (delete conflicts):
+    two actions are mutex only if ALL possible orderings fail.
+    NOOPs are exempt — they always use strict forall-step semantics.
+    """
 
     # --- Type 1: conflicting preconditions --------------------------------
+    # (unchanged — mutex precondition facts prevent both actions regardless
+    #  of ordering)
     for prec_fact in v.in_edges:
         for mutex_fact in prec_fact.exclusive:
-            # All operators that need mutex_fact are mutex with v
             for other_op in mutex_fact.out_edges:
                 if other_op is not v and other_op.uid_index >= 0:
                     do_exclusive(v, other_op)
 
-    # --- Type 2: delete conflicts -----------------------------------------
+    # --- Type 2: delete conflicts (exists-step) ---------------------------
+    # Precompute v's precondition names for fast reverse-order checks.
+    v_prec_names = {p.name for p in v.in_edges}
+
     for del_name in v.del_list:
-        # Find the fact in the next layer that this op deletes
         fact_next = fact_table_next.lookup(del_name)
         if fact_next is None:
             continue
         fact_cur = fact_next.prev_time
         if fact_cur is None:
             continue
-        # All ops requiring or producing this fact are mutex with v
+
+        # Sub-case 2a: other_op requires the fact that v deletes.
+        # Ordering v;other_op fails.  Only mutex if other_op;v also fails,
+        # i.e. other_op deletes a precondition of v.
         for other_op in fact_cur.out_edges:
-            if other_op is not v and other_op.uid_index >= 0:
+            if other_op is v or other_op.uid_index < 0:
+                continue
+            # NOOP exception: always mark mutex (forall-step for NOOPs)
+            if v.is_noop or other_op.is_noop:
                 do_exclusive(v, other_op)
-        # All ops that produce the next-layer fact
+                continue
+            # Exists-step: check if reverse ordering (other_op;v) also fails
+            # other_op;v fails if other_op deletes something v needs
+            other_del = other_op.del_list
+            if any(d in v_prec_names for d in other_del):
+                do_exclusive(v, other_op)
+
+        # Sub-case 2b: other_op produces the fact that v deletes (effect conflict).
+        # v;other_op: other_op re-adds the fact, so no conflict in this ordering
+        #   UNLESS v deletes a precondition of other_op.
+        # other_op;v: v deletes the effect, so conflict UNLESS other_op
+        #   deletes a precondition of v.
+        # Mutex only if BOTH orderings fail.
         for other_op in fact_next.in_edges:
-            if other_op is not v and other_op.uid_index >= 0:
+            if other_op is v or other_op.uid_index < 0:
+                continue
+            # NOOP exception: always mark mutex
+            if v.is_noop or other_op.is_noop:
+                do_exclusive(v, other_op)
+                continue
+            # Forward order (v;other_op) fails if v deletes a prec of other_op
+            other_prec_names = {p.name for p in other_op.in_edges}
+            fwd_fails = any(d in other_prec_names for d in v.del_list)
+            if not fwd_fails:
+                continue  # v;other_op is a valid ordering → not mutex
+            # Reverse order (other_op;v) fails if other_op deletes a prec of v
+            rev_fails = any(d in v_prec_names for d in other_op.del_list)
+            if rev_fails:
                 do_exclusive(v, other_op)
 
     # --- Type 3: NOOP conflicts -------------------------------------------
     if v.is_noop:
-        # NOOP for fact f: mutex with all non-noop producers of f
         if v.out_edges:
             fact_next = v.out_edges[0]  # noop has exactly one output
             for other_op in fact_next.in_edges:

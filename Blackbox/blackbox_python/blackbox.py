@@ -270,7 +270,47 @@ def main():
             result = planner.do_plan(cur_time)
 
             if result == Sat:
-                planner.print_plan(cur_time, output_file)
+                # Minimize actions at the current makespan using a fresh
+                # solver with cardinality constraints.
+                num_goals = graph.setup_goals(cur_time)
+                best_count = planner.minimize_plan_actions(cur_time, num_goals)
+                best_time = cur_time
+                best_snapshot = planner._snapshot_plan_usage(cur_time)
+                if debug >= 1:
+                    print(f"  Optimized to {best_count} actions at makespan {cur_time}")
+
+                # Search longer makespans — a less parallel plan may use
+                # fewer total actions.
+                stall = 0
+                for extra in range(1, best_count):
+                    ext_time = cur_time + extra
+                    if ext_time > max_time:
+                        break
+                    if graph_time < ext_time:
+                        t_ext = time_mod.time()
+                        graph_time = graph.extend_graph(graph_time, ext_time)
+                        graph_build_sec_total += (time_mod.time() - t_ext)
+                    if not graph.can_stop(ext_time):
+                        continue
+                    num_goals = graph.setup_goals(ext_time)
+                    ext_count = planner.minimize_plan_actions(ext_time, num_goals)
+                    if ext_count < 0:
+                        continue  # UNSAT at this makespan
+                    if debug >= 1:
+                        print(f"  Makespan {ext_time}: {ext_count} actions")
+                    if ext_count < best_count:
+                        best_count = ext_count
+                        best_time = ext_time
+                        best_snapshot = planner._snapshot_plan_usage(ext_time)
+                        stall = 0
+                    else:
+                        stall += 1
+                        if stall >= 3:
+                            break  # no improvement for 3 consecutive makespans
+
+                planner._restore_plan_usage(best_time, best_snapshot)
+                planner.plan_time = best_time
+                planner.print_plan(best_time, output_file)
                 found = True
                 break
             elif result == Unsat:
@@ -339,16 +379,20 @@ Options:
   -M <int>          Max nodes per layer (default: 2048)
   -maxfail <n>      Max solver failures (0=unlimited)
   -maxauto <n>      Max auto plan length (default: 100)
-  -maxglobalsec <n> Global time limit in seconds
+  -maxglobalsec <n> Global time limitclaud in seconds
 
 Solver specification:
   -solver {-maxsec N} <solver> {-then {-maxsec N} <solver> ...}
 
-  Available solvers (via PySAT):
-    cadical     CaDiCaL 1.9.5 (default solver)
+  Available solvers:
+    cadical     CaDiCaL 1.9.5 (default solver, via PySAT)
     graphplan   Built-in backward-chaining search
-    glucose     Glucose 4.2 (strong on industrial benchmarks)
-    maple       MapleChrono (SAT competition 2018 winner)
+    glucose     Glucose 4.2 (via PySAT, strong on industrial benchmarks)
+    maple       MapleChrono (via PySAT, SAT competition 2018 winner)
+    minisat     MiniSat (via PySAT, classic CDCL solver)
+    kissat      Kissat (external binary, state-of-the-art)
+    walksat     WalkSAT (built-in, stochastic local search, incomplete)
+    dpll        Pure Python DPLL (Jeroslow-Wang heuristic, no clause learning)
 
 Examples:
   python blackbox.py -o domain.pddl -f problem.pddl
