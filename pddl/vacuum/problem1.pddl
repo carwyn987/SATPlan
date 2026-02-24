@@ -1,0 +1,11 @@
+(define (problem vac-4cells)
+  (:domain vacuum)
+  (:objects p1 p2 p3 p4 - pos)
+  (:init
+    (at p1)
+    (adj p1 p2) (adj p2 p3) (adj p3 p4)
+    (adj p2 p1) (adj p3 p2) (adj p4 p3)
+    (dirty p2) (dirty p4)
+  )
+  (:goal (and (at p3) (not (dirty p2)) (not (dirty p4))))
+)

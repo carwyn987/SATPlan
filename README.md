@@ -10,6 +10,9 @@ Two SAT-based planning systems that convert PDDL problems into Boolean satisfiab
 ## Requirements
 
 - Python 3.10+
+- `pip install -r requirements.txt`
+
+Dependencies [Optional]
 - PySAT: `pip install python-sat`
 - Kissat (optional): `pip install passagemath-kissat`
 - WalkSAT (optional): see [Building External Solvers](#building-external-solvers)
@@ -21,7 +24,7 @@ Two SAT-based planning systems that convert PDDL problems into Boolean satisfiab
 ### Quick Start
 
 ```bash
-cd SATPLAN/Blackbox/blackbox_python
+cd Blackbox/blackbox_python
 
 # Run on the included example (Depot domain)
 python blackbox.py -o pddl_problems/domain.pddl -f pddl_problems/problem.pddl
